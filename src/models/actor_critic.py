@@ -35,6 +35,7 @@ class ActorCriticConfig:
     channels: List[int]
     down: List[int]
     num_actions: Optional[int] = None
+    code_embedding_dim: int = 768  # CodeBERT output dimension
 
 
 class ActorCritic(nn.Module):
@@ -46,6 +47,13 @@ class ActorCritic(nn.Module):
         self.lstm = nn.LSTMCell(input_dim_lstm, cfg.lstm_dim)
         self.critic_linear = nn.Linear(cfg.lstm_dim, 1)
         self.actor_linear = nn.Linear(cfg.lstm_dim, cfg.num_actions)
+
+        # Code embedding projection: maps CodeBERT 768-dim → lstm_dim
+        # Zero-initialized so DIAMOND starts identical to base CS:GO model.
+        # Learns to use code semantics only as (code, visual consequence) pairs accumulate.
+        self.code_projection = nn.Linear(cfg.code_embedding_dim, cfg.lstm_dim, bias=True)
+        nn.init.zeros_(self.code_projection.weight)
+        nn.init.zeros_(self.code_projection.bias)
 
         self.actor_linear.weight.data.fill_(0)
         self.actor_linear.bias.data.fill_(0)
@@ -65,11 +73,23 @@ class ActorCritic(nn.Module):
         self.env_loop = make_env_loop(rl_env, self)
         self.loss_cfg = loss_cfg
 
-    def predict_act_value(self, obs: Tensor, hx_cx: Tuple[Tensor, Tensor]) -> ActorCriticOutput:
+    def predict_act_value(
+        self,
+        obs: Tensor,
+        hx_cx: Tuple[Tensor, Tensor],
+        code_embedding: Optional[Tensor] = None,
+    ) -> ActorCriticOutput:
         assert obs.ndim == 4
         x = self.encoder(obs)
         x = x.flatten(start_dim=1)
         hx, cx = self.lstm(x, hx_cx)
+
+        # Inject code semantic signal into LSTM hidden state.
+        # When code_embedding is None or all-zeros, code_projection outputs zeros
+        # (zero-initialized) and behavior is identical to base model.
+        if code_embedding is not None:
+            hx = hx + self.code_projection(code_embedding.to(hx.device))
+
         return ActorCriticOutput(self.actor_linear(hx), self.critic_linear(hx).squeeze(dim=1), (hx, cx))
 
     def forward(self) -> LossAndLogs:
